@@ -84,13 +84,13 @@ require (
 	github.com/Code-Hex/go-infinity-channel v1.0.0 // indirect
 	github.com/VividCortex/ewma v1.2.0 // indirect
 	github.com/a8m/envsubst v1.4.3 // indirect
-	github.com/agext/levenshtein v1.2.1 // indirect
+	github.com/agext/levenshtein v1.2.3 // indirect
 	github.com/alecthomas/participle/v2 v2.1.4 // indirect
 	github.com/apparentlymart/go-textseg/v15 v15.0.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	// gomodjail:unconfined
-	github.com/bmatcuk/doublestar/v4 v4.7.1 // indirect
-	github.com/buger/jsonparser v1.1.2 // indirect
+	github.com/bmatcuk/doublestar/v4 v4.10.4 // indirect
+	github.com/buger/jsonparser v1.6.1 // indirect
 	github.com/containerd/cgroups/v3 v3.1.3 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	// gomodjail:unconfined
