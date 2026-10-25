@@ -1,0 +1,108 @@
+name: 'windows plain smoke test'
+description: >
+  Runs Lima's create / start / shell / copy / stop / delete cycle against a
+  given template on a plain Windows host, and dumps the instance logs on
+  failure.
+inputs:
+  template:
+    description: Path to the Lima template (e.g. .\templates\experimental\wsl2.yaml).
+    required: true
+  instance-name:
+    description: Name to use for the test instance.
+    required: false
+    default: plain
+  vm-type:
+    description: >
+      Lima vmType to force via `--vm-type` (e.g. "qemu" or "wsl2"). When empty,
+      the template or Lima's default decides.
+    required: false
+    default: ''
+  launch-default-distro-during-stop:
+    description: >
+      When 'true', test that `limactl stop` completes even if the instance's
+      distro restarts during it. GitHub's runner agent sometimes runs
+      `wsl -u root -e ls`, which starts the default distro, and that is the
+      instance's when no other is installed. The step runs the same command
+      while the stop terminates the instance. If the stop's status checks then
+      keep the restarted distro running, the stop times out. Only for the WSL2
+      driver.
+    required: false
+    default: 'false'
+runs:
+  using: composite
+  steps:
+  - name: Smoke test (create / start / shell / copy / stop / delete)
+    shell: pwsh
+    env:
+      LIMA_HOME: ${{ runner.temp }}\lima
+      INSTANCE: ${{ inputs.instance-name }}
+      TEMPLATE: ${{ inputs.template }}
+      VM_TYPE: ${{ inputs.vm-type }}
+      LAUNCH_DEFAULT_DISTRO_DURING_STOP: ${{ inputs.launch-default-distro-during-stop }}
+    run: |
+      $ErrorActionPreference = 'Stop'
+      # $ErrorActionPreference does not stop on a native command's exit code.
+      function Invoke-Limactl {
+        & .\_output\bin\limactl.exe --debug @args
+        if ($LASTEXITCODE -ne 0) { throw "limactl $($args -join ' ') exited $LASTEXITCODE" }
+      }
+      if (Test-Path $env:LIMA_HOME) { Remove-Item $env:LIMA_HOME -Recurse -Force }
+      New-Item -ItemType Directory -Path $env:LIMA_HOME | Out-Null
+      $createArgs = @('--tty=false', "--name=$env:INSTANCE")
+      if ($env:VM_TYPE) { $createArgs += "--vm-type=$env:VM_TYPE" }
+      $createArgs += $env:TEMPLATE
+      Invoke-Limactl create @createArgs
+      Invoke-Limactl start $env:INSTANCE
+      Invoke-Limactl shell --tty=false $env:INSTANCE -- uname -srm
+      'roundtrip' | Out-File -Encoding ascii "$env:LIMA_HOME\rt.txt"
+      Invoke-Limactl copy "$env:LIMA_HOME\rt.txt" "${env:INSTANCE}:/tmp/rt.txt"
+      Invoke-Limactl shell --tty=false $env:INSTANCE -- cat /tmp/rt.txt
+      # Cover the guest -> host direction too.
+      Invoke-Limactl copy "${env:INSTANCE}:/tmp/rt.txt" "$env:LIMA_HOME\rt-back.txt"
+      # -Raw yields $null for an empty file, and $null.Trim() would throw
+      # before the mismatch message a zero-byte copy is meant to produce.
+      $back = "$(Get-Content "$env:LIMA_HOME\rt-back.txt" -Raw)".Trim()
+      if ($back -ne 'roundtrip') {
+        throw "round-trip mismatch: expected 'roundtrip', got '$back'"
+      }
+      if ($env:LAUNCH_DEFAULT_DISTRO_DURING_STOP -eq 'true') {
+        $launcher = Start-Job -ScriptBlock {
+          while (-not (Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" |
+              Where-Object { $_.CommandLine -like '*--terminate*' })) {
+            Start-Sleep -Milliseconds 100
+          }
+          # Give the terminate time to begin, so the launch starts the distro again.
+          Start-Sleep -Milliseconds 200
+          wsl.exe -u root -e ls *> $null
+          if ($LASTEXITCODE -ne 0) { throw "wsl.exe -u root -e ls exited $LASTEXITCODE" }
+          'launched'
+        }
+      }
+      Invoke-Limactl stop $env:INSTANCE
+      if ($launcher) {
+        $launched = Wait-Job $launcher -Timeout 30 | Receive-Job
+        Remove-Job $launcher -Force
+        if ($launched -ne 'launched') { throw 'default-distro launch during limactl stop did not complete' }
+      }
+      Invoke-Limactl delete --force $env:INSTANCE
+
+  - name: Dump Lima logs on failure
+    if: failure()
+    shell: pwsh
+    env:
+      LIMA_HOME: ${{ runner.temp }}\lima
+      INSTANCE: ${{ inputs.instance-name }}
+    run: |
+      $instDir = Join-Path $env:LIMA_HOME $env:INSTANCE
+      if (-not (Test-Path $instDir)) {
+        Write-Host "No instance directory at $instDir, nothing to dump."
+        exit 0
+      }
+      Get-ChildItem $instDir | Format-Table Name, Length, LastWriteTime
+      foreach ($name in 'ha.stdout.log','ha.stderr.log','serial.log','lima.yaml','ssh.config') {
+        $p = Join-Path $instDir $name
+        if (Test-Path $p) {
+          Write-Host ("===== {0} =====" -f $p)
+          Get-Content $p
+        }
+      }

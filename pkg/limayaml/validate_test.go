@@ -1,0 +1,785 @@
+// SPDX-FileCopyrightText: Copyright The Lima Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package limayaml
+
+import (
+	"fmt"
+	"runtime"
+	"strings"
+	"testing"
+
+	logrustest "github.com/sirupsen/logrus/hooks/test"
+	"gotest.tools/v3/assert"
+
+	"github.com/lima-vm/lima/v2/pkg/limatype"
+	"github.com/lima-vm/lima/v2/pkg/version"
+)
+
+func TestValidateEmpty(t *testing.T) {
+	y, err := Load(t.Context(), []byte{}, "empty.yaml")
+	assert.NilError(t, err)
+	err = Validate(y, false)
+	assert.Error(t, err, "field `images` must be set")
+}
+
+func TestValidateMinimumLimaVersion(t *testing.T) {
+	images := `images: [{"location": "/"}]`
+
+	tests := []struct {
+		name               string
+		currentVersion     string
+		minimumLimaVersion string
+		wantErr            string
+	}{
+		{
+			name:               "minimumLimaVersion less than current version",
+			currentVersion:     "1.1.1-114-g5bf5e513",
+			minimumLimaVersion: "1.1.0",
+			wantErr:            "",
+		},
+		{
+			name:               "minimumLimaVersion greater than current version",
+			currentVersion:     "1.1.1-114-g5bf5e513",
+			minimumLimaVersion: "1.1.2",
+			wantErr:            "template requires Lima version `1.1.2`; this is only `1.1.1-114-g5bf5e513`",
+		},
+		{
+			name:               "invalid current version",
+			currentVersion:     "<unknown>",
+			minimumLimaVersion: "0.8.0",
+			wantErr:            "", // Unparsable versions are treated as "latest"
+		},
+		{
+			name:               "invalid minimumLimaVersion",
+			currentVersion:     "1.1.1-114-g5bf5e513",
+			minimumLimaVersion: "invalid",
+			wantErr:            "field `minimumLimaVersion` must be a semvar value, got `invalid`: invalid is not in dotted-tri format", // Only parse error, no comparison error
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldVersion := version.Version
+			version.Version = tt.currentVersion
+			t.Cleanup(func() { version.Version = oldVersion })
+
+			y, err := Load(t.Context(), []byte("minimumLimaVersion: "+tt.minimumLimaVersion+"\n"+images), "lima.yaml")
+			assert.NilError(t, err)
+
+			err = Validate(y, false)
+			if tt.wantErr == "" {
+				assert.NilError(t, err)
+			} else {
+				assert.Error(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateDigest(t *testing.T) {
+	images := `images: [{"location": "https://cloud-images.ubuntu.com/releases/oracular/release-20250701/ubuntu-24.10-server-cloudimg-amd64.img",digest: "69f31d3208895e5f646e345fbc95190e5e311ecd1359a4d6ee2c0b6483ceca03"}]`
+	validProbe := `probes: [{"script": "#!foo"}]`
+	y, err := Load(t.Context(), []byte(validProbe+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+	err = Validate(y, false)
+	assert.Error(t, err, "field `images[0].digest` is invalid: 69f31d3208895e5f646e345fbc95190e5e311ecd1359a4d6ee2c0b6483ceca03: invalid checksum digest format")
+
+	images2 := `images: [{"location": "https://cloud-images.ubuntu.com/releases/oracular/release-20250701/ubuntu-24.10-server-cloudimg-amd64.img",digest: "sha001:69f31d3208895e5f646e345fbc95190e5e311ecd1359a4d6ee2c0b6483ceca03"}]`
+	y2, err := Load(t.Context(), []byte(validProbe+"\n"+images2), "lima.yaml")
+	assert.NilError(t, err)
+	err = Validate(y2, false)
+	assert.Error(t, err, "field `images[0].digest` is invalid: sha001:69f31d3208895e5f646e345fbc95190e5e311ecd1359a4d6ee2c0b6483ceca03: unsupported digest algorithm")
+}
+
+func TestValidateProbes(t *testing.T) {
+	images := `images: [{"location": "/"}]`
+	validProbe := `probes: [{"script": "#!foo"}]`
+	y, err := Load(t.Context(), []byte(validProbe+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.NilError(t, err)
+
+	invalidProbe := `probes: [{"script": "foo"}]`
+	y, err = Load(t.Context(), []byte(invalidProbe+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.Error(t, err, "field `probe[0].script` must start with a '#!' line")
+
+	invalidProbe = `probes: [{file: {digest: decafbad}}]`
+	y, err = Load(t.Context(), []byte(invalidProbe+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.Error(t, err, "field `probe[0].file.digest` support is not yet implemented\n"+
+		"field `probe[0].script` must start with a '#!' line")
+}
+
+func TestValidateProvisionMode(t *testing.T) {
+	images := `images: [{location: /}]`
+	provisionBoot := `provision: [{mode: boot, script: "touch /tmp/param-$PARAM_BOOT"}]`
+	y, err := Load(t.Context(), []byte(provisionBoot+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.NilError(t, err)
+
+	provisionUser := `provision: [{mode: user, script: "touch /tmp/param-$PARAM_USER"}]`
+	y, err = Load(t.Context(), []byte(provisionUser+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.NilError(t, err)
+
+	provisionDependency := `provision: [{mode: ansible, script: "touch /tmp/param-$PARAM_DEPENDENCY"}]`
+	y, err = Load(t.Context(), []byte(provisionDependency+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.NilError(t, err)
+
+	provisionInvalid := `provision: [{mode: invalid}]`
+	y, err = Load(t.Context(), []byte(provisionInvalid+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.Error(t, err, "field `provision[0].mode` must one of `system`, `user`, `boot`, `data`, `dependency`, `ansible`, or `yq`\n"+
+		"field `provision[0].script` must not be empty")
+}
+
+func TestValidateProvisionModeOnWindows(t *testing.T) {
+	windowsBase := `
+os: Windows
+arch: x86_64
+vmType: qemu
+images:
+  - location: /
+osOpts:
+  Windows:
+    virtioWin:
+    - location: /
+      arch: "x86_64"
+`
+
+	tests := []struct {
+		name       string
+		provision  string
+		wantErrMsg string
+	}{
+		{
+			name:       "ansible not supported on windows",
+			provision:  `provision: [{mode: ansible}]`,
+			wantErrMsg: "provision mode `ansible` is not supported on Windows VM",
+		},
+		{
+			name:       "boot not supported on windows",
+			provision:  `provision: [{mode: boot, script: "echo hi"}]`,
+			wantErrMsg: "provision mode `boot` is not supported on Windows VM",
+		},
+		{
+			name:       "yq not supported on windows",
+			provision:  `provision: [{mode: yq, expression: ".x=1", path: /tmp}]`,
+			wantErrMsg: "provision mode `yq` is not supported on Windows VM",
+		},
+		{
+			name:      "system is supported on windows",
+			provision: `provision: [{mode: system, script: "echo hi"}]`,
+		},
+		{
+			name:      "user is supported on windows",
+			provision: `provision: [{mode: user, script: "echo hi"}]`,
+		},
+		{
+			name:      "dependency is supported on windows",
+			provision: `provision: [{mode: dependency, script: "echo hi"}]`,
+		},
+		{
+			name:      "data is supported on windows",
+			provision: `provision: [{mode: data, path: /tmp, content: hello}]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			y, err := Load(t.Context(), []byte(windowsBase+"\n"+tt.provision), "template.yaml")
+			assert.NilError(t, err)
+
+			err = Validate(y, false)
+			if tt.wantErrMsg == "" {
+				assert.NilError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tt.wantErrMsg)
+			}
+		})
+	}
+}
+
+func TestValidateProvisionData(t *testing.T) {
+	images := `images: [{location: /}]`
+	validData := `provision: [{mode: data, path: /tmp, content: hello}]`
+	y, err := Load(t.Context(), []byte(validData+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.NilError(t, err)
+
+	invalidData := `provision: [{mode: data, content: hello}]`
+	y, err = Load(t.Context(), []byte(invalidData+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.Error(t, err, "field `provision[0].path` must not be empty when mode is `data`")
+
+	invalidData = `provision: [{mode: data, path: /tmp, content: hello, permissions: 9}]`
+	y, err = Load(t.Context(), []byte(invalidData+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.ErrorContains(t, err, "provision[0].permissions` must be an octal number")
+}
+
+func TestValidateProvisionYQ(t *testing.T) {
+	images := `images: [{location: /}]`
+	param := `param: {"cdi": "true"}`
+	// Valid
+	validYQProvision := `provision: [{mode: yq, expression: ".features.cdi={{.Param.cdi}}", path: /tmp}]`
+	y, err := Load(t.Context(), []byte(param+"\n"+validYQProvision+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+	err = Validate(y, false)
+	assert.NilError(t, err)
+
+	// Missing path
+	invalidYQProvision := `provision: [{mode: yq, expression: ".features.cdi={{.Param.cdi}}"}]`
+	y, err = Load(t.Context(), []byte(param+"\n"+invalidYQProvision+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+	err = Validate(y, false)
+	assert.ErrorContains(t, err, "field `provision[0].path` must not be empty when mode is `yq`")
+
+	// non-absolute path
+	invalidYQProvision = `provision: [{mode: yq, expression: ".features.cdi={{.Param.cdi}}", path: tmp}]`
+	y, err = Load(t.Context(), []byte(param+"\n"+invalidYQProvision+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+	err = Validate(y, false)
+	assert.ErrorContains(t, err, "field `provision[0].path` must be an absolute path")
+
+	// Missing expression
+	invalidYQProvision = `provision: [{mode: yq, path: "/{{.Param.cdi}}"}]`
+	y, err = Load(t.Context(), []byte(param+"\n"+invalidYQProvision+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+	err = Validate(y, false)
+	assert.ErrorContains(t, err, "field `provision[0].expression` must not be empty when mode is `yq`")
+
+	// Invalid permissions
+	invalidYQProvision = `provision: [{mode: yq, expression: ".features.cdi={{.Param.cdi}}", path: /tmp, permissions: 9}]`
+	y, err = Load(t.Context(), []byte(param+"\n"+invalidYQProvision+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+	err = Validate(y, false)
+	assert.ErrorContains(t, err, "provision[0].permissions` must be an octal number")
+}
+
+func TestValidateAdditionalDisks(t *testing.T) {
+	images := `images: [{"location": "/"}]`
+
+	validDisks := `
+additionalDisks:
+  - name: "disk1"
+  - name: "disk2"
+`
+	y, err := Load(t.Context(), []byte(validDisks+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.NilError(t, err)
+
+	invalidDisks := `
+additionalDisks:
+  - name: ""
+`
+	y, err = Load(t.Context(), []byte(invalidDisks+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.Error(t, err, "field `additionalDisks[0].name is invalid`: identifier must not be empty")
+
+	// A name too long to fit in the filesystem label is still valid: the label
+	// is truncated, but Lima does not identify the disk by its label. Rejecting
+	// these would break configurations that work correctly. Validate logs a
+	// notice instead, once for each such disk. Validate(y, true) also runs
+	// warnExperimental, which needs mountType; Load leaves it unset.
+	longDisks := `
+mountType: "reverse-sshfs"
+additionalDisks:
+  - name: "myproject-images"
+    fsType: "ext4"
+  - name: "project1"
+    fsType: "xfs"
+  - name: "project"
+    fsType: "xfs"
+`
+	y, err = Load(t.Context(), []byte(longDisks+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+
+	notices := labelNotices(t, y)
+	assert.Equal(t, len(notices), 2)
+	assert.Assert(t, strings.Contains(notices[0], "`lima-myproject-i`"), notices[0])
+	assert.Assert(t, strings.Contains(notices[1], "`lima-project`"), notices[1])
+
+	// Lima writes a label only when the Linux boot script formats the disk, so
+	// neither of these configurations may report truncating one.
+	for name, yml := range map[string]string{
+		"format: false": "additionalDisks: [{name: preformatted-disk, format: false}]",
+		"darwin guest":  "os: Darwin\nadditionalDisks: [{name: preformatted-disk}]",
+	} {
+		t.Run(name, func(t *testing.T) {
+			y, err := Load(t.Context(), []byte("mountType: reverse-sshfs\n"+images+"\n"+yml), "lima.yaml")
+			assert.NilError(t, err)
+			assert.DeepEqual(t, labelNotices(t, y), []string(nil))
+		})
+	}
+}
+
+// labelNotices validates y with warnings enabled and returns the messages of
+// the additionalDisks label-length notices it logged. Validation errors are
+// ignored: only the notices are of interest.
+func labelNotices(t *testing.T, y *limatype.LimaYAML) []string {
+	t.Helper()
+	hook := logrustest.NewGlobal()
+	defer hook.Reset()
+	_ = Validate(y, true)
+	var notices []string
+	for _, e := range hook.AllEntries() {
+		if strings.Contains(e.Message, "filesystem label") {
+			notices = append(notices, e.Message)
+		}
+	}
+	return notices
+}
+
+func TestValidateBlockDevices(t *testing.T) {
+	for _, path := range []string{"/etc/passwd", "/dev/null", "/dev/./disk4", "/dev/DISK4", "/dev/disk4 ", "/dev/disk4\n", "/dev/disk4/../disk5"} {
+		assert.Assert(t, validateBlockDevices([]string{path}) != nil, "accepted %q", path)
+	}
+	assert.ErrorContains(t, validateBlockDevices([]string{"/dev/disk4", "/dev/disk4"}), "duplicate")
+	y, err := Load(t.Context(), []byte(`
+images:
+  - location: /
+vmType: qemu
+blockDevices:
+  - /dev/disk4
+`), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.NilError(t, err)
+}
+
+func TestValidateBlockDevicesRequiresAbsolutePaths(t *testing.T) {
+	y, err := Load(t.Context(), []byte(`
+images:
+  - location: /
+blockDevices:
+  - disk4
+`), "lima.yaml")
+	assert.NilError(t, err)
+
+	err = Validate(y, false)
+	assert.ErrorContains(t, err, "field `blockDevices[0]`")
+	assert.ErrorContains(t, err, "must be an absolute path")
+}
+
+func TestValidateBlockDevicesRejectsOverlappingStorage(t *testing.T) {
+	for _, devices := range [][]string{
+		{"/dev/disk4", "/dev/rdisk4"},
+		{"/dev/disk4", "/dev/disk4s1"},
+		{"/dev/rdisk4s1", "/dev/disk4s1"},
+		{"/dev/disk4s1", "/dev/rdisk4s1s2"},
+	} {
+		for _, pair := range [][]string{devices, {devices[1], devices[0]}} {
+			t.Run(strings.Join(pair, "+"), func(t *testing.T) {
+				assert.ErrorContains(t, validateBlockDevices(pair), "overlap")
+			})
+		}
+	}
+	// Reusing the whole-disk lock is necessary for disjoint partitions; name
+	// prefixes alone must not confuse disk4 with disk40 or partition 1 with 10.
+	for _, devices := range [][]string{
+		{"/dev/disk4s1", "/dev/rdisk4s2"},
+		{"/dev/disk4", "/dev/rdisk40"},
+		{"/dev/disk4s1", "/dev/disk4s10"},
+		{"/dev/disk4s1s1", "/dev/rdisk4s1s2"},
+	} {
+		assert.NilError(t, validateBlockDevices(devices))
+	}
+}
+
+func TestValidateAdditionalDisksMountPoint(t *testing.T) {
+	images := `images: [{"location": "/"}]`
+
+	validMountPoint := `
+additionalDisks:
+  - name: "disk1"
+    mountPoint: "/data"
+  - name: "disk2"
+    mount: false
+  - name: "disk3"
+    mountPoint: "/var/lib/data"
+`
+	y, err := Load(t.Context(), []byte(validMountPoint+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+	assert.NilError(t, Validate(y, false))
+
+	for _, tc := range []struct {
+		mountPoint string
+		expected   string
+	}{
+		{"data", "field `additionalDisks[0].mountPoint` must be an absolute path, got `data`"},
+		{"~/data", "field `additionalDisks[0].mountPoint` must be an absolute path, got `~/data`"},
+		{"/etc", "field `additionalDisks[0].mountPoint` must not be a critical system path such as /etc or /usr"},
+		{"/home", "field `additionalDisks[0].mountPoint` must not be a critical system path such as /etc or /usr"},
+	} {
+		invalid := "additionalDisks:\n  - name: \"disk1\"\n    mountPoint: \"" + tc.mountPoint + "\"\n"
+		y, err = Load(t.Context(), []byte(invalid+"\n"+images), "lima.yaml")
+		assert.NilError(t, err)
+		assert.Error(t, Validate(y, false), tc.expected)
+	}
+
+	reservedHome := "user: {home: \"/home/foo.guest\"}\nadditionalDisks:\n  - name: \"disk1\"\n    mountPoint: \"/home/foo.guest\"\n"
+	y, err = Load(t.Context(), []byte(reservedHome+"\n"+images), "lima.yaml")
+	assert.NilError(t, err)
+	assert.Error(t, Validate(y, false), "field `additionalDisks[0].mountPoint` is the reserved internal home directory `/home/foo.guest`")
+}
+
+func TestValidateParamName(t *testing.T) {
+	images := `images: [{"location": "/"}]`
+	validProvision := `provision: [{"script": "echo $PARAM_name $PARAM_NAME $PARAM_Name_123"}]`
+	validParam := []string{
+		`param: {"name": "value"}`,
+		`param: {"NAME": "value"}`,
+		`param: {"Name_123": "value"}`,
+	}
+	for _, param := range validParam {
+		y, err := Load(t.Context(), []byte(param+"\n"+validProvision+"\n"+images), "lima.yaml")
+		assert.NilError(t, err)
+
+		err = Validate(y, false)
+		assert.NilError(t, err)
+	}
+
+	invalidProvision := `provision: [{"script": "echo $PARAM__Name $PARAM_3Name $PARAM_Last.Name"}]`
+	invalidParam := []string{
+		`param: {"_Name": "value"}`,
+		`param: {"3Name": "value"}`,
+		`param: {"Last.Name": "value"}`,
+	}
+	for _, param := range invalidParam {
+		y, err := Load(t.Context(), []byte(param+"\n"+invalidProvision+"\n"+images), "lima.yaml")
+		assert.NilError(t, err)
+
+		err = Validate(y, false)
+		assert.ErrorContains(t, err, "name does not match regex")
+	}
+}
+
+func TestValidateParamValue(t *testing.T) {
+	images := `images: [{"location": "/"}]`
+	provision := `provision: [{"script": "echo $PARAM_name"}]`
+	validParam := []string{
+		`param: {"name": ""}`,
+		`param: {"name": "foo bar"}`,
+		`param: {"name": "foo\tbar"}`,
+		`param: {"name": "Symbols ½ and emoji → 👀"}`,
+	}
+	for _, param := range validParam {
+		y, err := Load(t.Context(), []byte(param+"\n"+provision+"\n"+images), "lima.yaml")
+		assert.NilError(t, err)
+
+		err = Validate(y, false)
+		assert.NilError(t, err)
+	}
+
+	invalidParam := []string{
+		`param: {"name": "The end.\n"}`,
+		`param: {"name": "\r"}`,
+	}
+	for _, param := range invalidParam {
+		y, err := Load(t.Context(), []byte(param+"\n"+provision+"\n"+images), "lima.yaml")
+		assert.NilError(t, err)
+
+		err = Validate(y, false)
+		assert.ErrorContains(t, err, "value contains unprintable character")
+	}
+}
+
+func TestValidateParamIsUsed(t *testing.T) {
+	paramYaml := `param:
+  name: value`
+	_, err := Load(t.Context(), []byte(paramYaml), "paramIsNotUsed.yaml")
+	assert.Error(t, err, "field `param` key `name` is not used in any provision, probe, copyToHost, or portForward")
+
+	fieldsUsingParam := []string{
+		`mounts: [{"location": "/tmp/{{ .Param.name }}"}]`,
+		`mounts: [{"location": "/tmp", mountPoint: "/tmp/{{ .Param.name }}"}]`,
+		`provision: [{"script": "echo {{ .Param.name }}"}]`,
+		`provision: [{"script": "echo $PARAM_name"}]`,
+		`probes: [{"script": "echo {{ .Param.name }}"}]`,
+		`probes: [{"script": "echo $PARAM_name"}]`,
+		`copyToHost: [{"guest": "/tmp/{{ .Param.name }}", "host": "/tmp"}]`,
+		`copyToHost: [{"guest": "/tmp", "host": "/tmp/{{ .Param.name }}"}]`,
+		`portForwards: [{"guestSocket": "/tmp/{{ .Param.name }}", "hostSocket": "/tmp"}]`,
+		`portForwards: [{"guestSocket": "/tmp", "hostSocket": "/tmp/{{ .Param.name }}"}]`,
+	}
+	for _, fieldUsingParam := range fieldsUsingParam {
+		_, err = Load(t.Context(), []byte(fieldUsingParam+"\n"+paramYaml), "paramIsUsed.yaml")
+		//
+		assert.NilError(t, err)
+	}
+
+	// use "{{if eq .Param.rootful \"true\"}}…{{else}}…{{end}}" in provision, probe, copyToHost, and portForward
+	rootfulYaml := `param:
+  rootful: true`
+	fieldsUsingIfParamRootfulTrue := []string{
+		`mounts: [{"location": "/tmp/{{if eq .Param.rootful \"true\"}}rootful{{else}}rootless{{end}}", "mountPoint": "/tmp"}]`,
+		`mounts: [{"location": "/tmp", "mountPoint": "/tmp/{{if eq .Param.rootful \"true\"}}rootful{{else}}rootless{{end}}"}]`,
+		`provision: [{"script": "echo {{if eq .Param.rootful \"true\"}}rootful{{else}}rootless{{end}}"}]`,
+		`probes: [{"script": "echo {{if eq .Param.rootful \"true\"}}rootful{{else}}rootless{{end}}"}]`,
+		`copyToHost: [{"guest": "/tmp/{{if eq .Param.rootful \"true\"}}rootful{{else}}rootless{{end}}", "host": "/tmp"}]`,
+		`copyToHost: [{"guest": "/tmp", "host": "/tmp/{{if eq .Param.rootful \"true\"}}rootful{{else}}rootless{{end}}"}]`,
+		`portForwards: [{"guestSocket": "{{if eq .Param.rootful \"true\"}}/var/run{{else}}/run/user/{{.UID}}{{end}}/docker.sock", "hostSocket": "{{.Dir}}/sock/docker.sock"}]`,
+		`portForwards: [{"guestSocket": "/var/run/docker.sock", "hostSocket": "{{.Dir}}/sock/docker-{{if eq .Param.rootful \"true\"}}rootful{{else}}rootless{{end}}.sock"}]`,
+	}
+	for _, fieldUsingIfParamRootfulTrue := range fieldsUsingIfParamRootfulTrue {
+		_, err = Load(t.Context(), []byte(fieldUsingIfParamRootfulTrue+"\n"+rootfulYaml), "paramIsUsed.yaml")
+		//
+		assert.NilError(t, err)
+	}
+
+	// use rootFul instead of rootful
+	rootFulYaml := `param:
+  rootFul: true`
+	for _, fieldUsingIfParamRootfulTrue := range fieldsUsingIfParamRootfulTrue {
+		_, err = Load(t.Context(), []byte(fieldUsingIfParamRootfulTrue+"\n"+rootFulYaml), "paramIsUsed.yaml")
+		//
+		assert.Error(t, err, "field `param` key `rootFul` is not used in any provision, probe, copyToHost, or portForward")
+	}
+}
+
+func TestValidateMultipleErrors(t *testing.T) {
+	yamlWithMultipleErrors := `
+os: windows
+arch: unsupported_arch
+portForwards:
+  - guestPort: 22
+    hostPort: 2222
+  - guestPort: 8080
+    hostPort: 65536
+provision:
+  - mode: invalid_mode
+    script: echo test
+  - mode: data
+    content: test
+`
+
+	y, err := Load(t.Context(), []byte(yamlWithMultipleErrors), "multiple-errors.yaml")
+	assert.NilError(t, err)
+	err = Validate(y, false)
+	t.Logf("Validation errors: %v", err)
+
+	assert.Error(t, err, "field `os` must be one of [`Linux` `Darwin` `FreeBSD` `Windows`]; got `windows`\n"+
+		"field `arch` must be one of [x86_64 aarch64 armv7l ppc64le riscv64 s390x]; got `unsupported_arch`\n"+
+		"field `images` must be set\n"+
+		"field `provision[0].mode` must one of `system`, `user`, `boot`, `data`, `dependency`, `ansible`, or `yq`\n"+
+		"field `provision[1].path` must not be empty when mode is `data`")
+}
+
+func TestValidateAgainstLatestConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		yNew    string
+		yLatest string
+		wantErr string
+	}{
+		{
+			name:    "Valid disk size unchanged",
+			yNew:    `disk: 100GiB`,
+			yLatest: `disk: 100GiB`,
+		},
+		{
+			name:    "Valid disk size increased",
+			yNew:    `disk: 200GiB`,
+			yLatest: `disk: 100GiB`,
+		},
+		{
+			name:    "No disk field in both YAMLs",
+			yNew:    ``,
+			yLatest: ``,
+		},
+		{
+			name:    "No disk field in new YAMLs",
+			yNew:    ``,
+			yLatest: `disk: 100GiB`,
+		},
+		{
+			name:    "No disk field in latest YAMLs",
+			yNew:    `disk: 100GiB`,
+			yLatest: ``,
+		},
+		{
+			name:    "Disk size shrunk",
+			yNew:    `disk: 50GiB`,
+			yLatest: `disk: 100GiB`,
+			wantErr: "field `disk`: shrinking the disk (100GiB --> 50GiB) is not supported",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateAgainstLatestConfig(t.Context(), []byte(tt.yNew), []byte(tt.yLatest))
+			if tt.wantErr == "" {
+				assert.NilError(t, err)
+			} else {
+				assert.Error(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestWindowsGuest(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("this test only works on linux or darwin")
+	}
+
+	baseYaml := `
+os: Windows
+arch: %s
+vmType: %s
+images:
+  - location: /
+osOpts:
+  Windows:
+    virtioWin:
+    - location: /
+      arch: "x86_64"
+`
+
+	testCases := []struct {
+		name       string
+		yaml       string
+		wantErrMsg string
+	}{
+		{
+			name: "ok",
+			yaml: fmt.Sprintf(baseYaml, limatype.X8664, limatype.QEMU),
+		},
+		{
+			name:       "qemu only supports Windows guest",
+			yaml:       fmt.Sprintf(baseYaml, limatype.X8664, limatype.VZ),
+			wantErrMsg: "currently Windows guest is only supported on `qemu`; got `vz`",
+		},
+		{
+			name:       "x86_64 and aarch64 only support Windows guest",
+			yaml:       fmt.Sprintf(baseYaml, limatype.ARMV7L, limatype.QEMU),
+			wantErrMsg: "currently Windows guest is only supported on [`x86_64`, `aarch64`]; got `armv7l`",
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			y, err := Load(t.Context(), []byte(tt.yaml), "template.yaml")
+			assert.NilError(t, err)
+			err = Validate(y, false)
+
+			if tt.wantErrMsg == "" {
+				assert.NilError(t, err)
+			} else {
+				assert.Equal(t, tt.wantErrMsg, err.Error())
+			}
+		})
+	}
+}
+
+func TestIsSupportedWindowsShell(t *testing.T) {
+	tests := []struct {
+		shell string
+		want  bool
+	}{
+		{"cmd.exe", true},
+		{"CMD.EXE", true},
+		{"powershell.exe", true},
+		{"pwsh.exe", true},
+		{`C:\Windows\System32\cmd.exe`, true},
+		{`C:/Windows/System32/cmd.exe`, true},
+		{`C:\Program Files\PowerShell\7\pwsh.exe`, true},
+		{"bash.exe", false},
+		{"cmd", false},
+		{"/bin/bash", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.shell, func(t *testing.T) {
+			assert.Equal(t, tt.want, IsSupportedWindowsShell(tt.shell))
+		})
+	}
+}
+
+func TestValidateUserShell(t *testing.T) {
+	posixImages := `images: [{"location": "/"}]`
+	windowsBase := `
+os: Windows
+arch: x86_64
+vmType: qemu
+images:
+  - location: /
+osOpts:
+  Windows:
+    virtioWin:
+    - location: /
+      arch: "x86_64"
+`
+
+	tests := []struct {
+		name       string
+		yaml       string
+		wantErrMsg string
+	}{
+		{
+			name: "posix absolute path ok",
+			yaml: posixImages + "\nuser:\n  shell: /bin/bash\n",
+		},
+		{
+			name:       "posix relative path rejected",
+			yaml:       posixImages + "\nuser:\n  shell: bash\n",
+			wantErrMsg: "field `user.shell` must be an absolute path, got `bash`",
+		},
+		{
+			name: "windows cmd.exe ok",
+			yaml: windowsBase + "\nuser:\n  shell: cmd.exe\n",
+		},
+		{
+			name: "windows pwsh.exe ok",
+			yaml: windowsBase + "\nuser:\n  shell: pwsh.exe\n",
+		},
+		{
+			name: "windows absolute cmd.exe ok",
+			yaml: windowsBase + "\nuser:\n  shell: 'C:\\Windows\\System32\\cmd.exe'\n",
+		},
+		{
+			name:       "windows posix shell rejected",
+			yaml:       windowsBase + "\nuser:\n  shell: /bin/bash\n",
+			wantErrMsg: "field `user.shell` must be one of [cmd.exe powershell.exe pwsh.exe] for Windows guest, got `/bin/bash`",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			y, err := Load(t.Context(), []byte(tt.yaml), "template.yaml")
+			assert.NilError(t, err)
+			err = Validate(y, false)
+			if tt.wantErrMsg == "" {
+				assert.NilError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tt.wantErrMsg)
+			}
+		})
+	}
+}

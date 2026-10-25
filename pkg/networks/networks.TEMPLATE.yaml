@@ -1,0 +1,49 @@
+# Path to socket_vmnet, the privileged helper that manages the "shared", "bridged"
+# and "host" networks on macOS. On Linux the same job is done by lima-privileged-net,
+# which ships with Lima and is therefore not configurable here.
+#
+# Because the helper is invoked via sudo it should be installed where only root
+# can modify/replace it. This means also none of the parent directories can be
+# writable by the user.
+#
+# The varRun directory also must not be writable by the user because it will
+# include the pid files of the helpers. Those will be terminated via sudo, so
+# replacing the pid file would allow killing of arbitrary privileged processes.
+# On macOS varRun however MUST be writable by the daemon user.
+#
+# None of the paths segments may be symlinks, why on macOS it has to be
+# /private/var instead of /var etc.
+paths:
+# socketVMNet requires Lima >= 0.12 .
+  socketVMNet: "{{.SocketVMNet}}"
+  varRun: {{.VarRun}}
+  sudoers: {{.Sudoers}}
+
+# The group that is allowed to run the network helper via sudo, and (on macOS)
+# to access the socket_vmnet socket. Users must set this to a group they belong
+# to (e.g. "staff" on macOS).
+group: {{.Group}}
+
+networks:
+  user-v2:
+    mode: user-v2
+    gateway: 192.168.104.1
+    netmask: 255.255.255.0
+  shared:
+    mode: shared
+    gateway: 192.168.105.1
+    dhcpEnd: 192.168.105.254
+    netmask: 255.255.255.0
+  bridged:
+    # On macOS this is a physical interface, e.g. "en0".
+    # On Linux it must be an *existing* bridge, e.g. "br0", created by the host
+    # administrator with NetworkManager, systemd-networkd, or netplan. Lima
+    # neither creates it nor enslaves physical interfaces.
+    mode: bridged
+    interface: {{.BridgedInterface}}
+    # bridged mode doesn't have a gateway; dhcp is managed by outside network
+  host:
+    mode: host
+    gateway: 192.168.106.1
+    dhcpEnd: 192.168.106.254
+    netmask: 255.255.255.0

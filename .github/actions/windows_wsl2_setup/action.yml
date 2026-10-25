@@ -1,0 +1,22 @@
+name: 'windows wsl2 setup'
+description: Enables WSL2.
+runs:
+  using: composite
+  steps:
+  - name: Enable WSL2
+    shell: pwsh
+    run: |
+      $ErrorActionPreference = 'Stop'
+      # $ErrorActionPreference does not stop on a native command's exit code.
+      wsl --set-default-version 2
+      if ($LASTEXITCODE -ne 0) { throw "wsl --set-default-version failed: $LASTEXITCODE" }
+      wsl --shutdown
+      if ($LASTEXITCODE -ne 0) { throw "wsl --shutdown failed: $LASTEXITCODE" }
+      # --update and --list --online reach a Microsoft update service that
+      # returns transient 403s, so these four calls are informational.
+      wsl --update
+      wsl --status
+      wsl --version
+      wsl --list --online
+      # pwsh would otherwise exit with --list --online's status.
+      exit 0
